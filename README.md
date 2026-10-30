@@ -9,6 +9,8 @@ installations and English on other systems.
 - Go 1.27.3 or later
 - A CGO-enabled C compiler for Windows, such as MinGW-w64
 
+The provided build command targets 64-bit Windows.
+
 ## Build
 
 From the project directory, run:
