@@ -2,29 +2,41 @@ package main
 
 import (
 	_ "embed"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
+	"fyne.io/systray"
 )
 
 type Config struct {
-	GamePath    string `json:"game_path"`
-	RepoURL     string `json:"repo_url"`
-	GitHubToken string `json:"github_token"`
+	GamePath       string `json:"game_path"`
+	RepoURL        string `json:"repo_url"`
+	GitHubToken    string `json:"github_token"`
+	StartMinimized bool   `json:"start_minimized"`
+	AutoSync       bool   `json:"auto_sync"`
+	Autostart      bool   `json:"autostart"`
+	LastSyncTime   string `json:"last_sync_time,omitempty"`
+	LastSyncStatus string `json:"last_sync_status,omitempty"`
 }
 
 const ConfigFileName = "config.json"
-const LocalRepoFolder = "./local_repo"
+const LocalRepoFolder = "local_repo"
 const MaxFolderSizeMB = 150
+const MaxPushFileSizeMB = 80
 
 //go:embed icon.png
 var windowIconPNG []byte
@@ -34,15 +46,28 @@ func main() {
 	myApp := app.NewWithID("wow.sync.launcher")
 	windowIcon := fyne.NewStaticResource("icon.png", windowIconPNG)
 	myApp.SetIcon(windowIcon)
-	myWindow := myApp.NewWindow(text.windowTitle)
+	myWindow := myApp.NewWindow("WoWWTFSync")
 	myWindow.SetIcon(windowIcon)
-	myWindow.Resize(fyne.NewSize(600, 520))
+	myWindow.Resize(fyne.NewSize(600, 560))
 
 	config, err := loadConfig()
+	configLoadError := err
 	if err != nil {
-		config = &Config{}
+		if config == nil {
+			config = &Config{}
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(os.Stderr, "load config:", err)
+		}
 	}
 
+	var configMu sync.Mutex
+	var operationMu sync.Mutex
+	getConfig := func() Config {
+		configMu.Lock()
+		defer configMu.Unlock()
+		return *config
+	}
 	gamePathEntry := widget.NewEntry()
 	gamePathEntry.SetPlaceHolder(text.gamePathPlaceholder)
 	gamePathEntry.SetText(config.GamePath)
@@ -55,80 +80,323 @@ func main() {
 	tokenEntry.SetPlaceHolder(text.tokenPlaceholder)
 	tokenEntry.SetText(config.GitHubToken)
 
-	// Компактный индикатор связи под полями
 	connectionLabel := widget.NewLabel(text.connectionChecking)
-
-	// Главный статус-бар для актуальности данных (где новее файлы)
 	statusLabel := widget.NewLabel(text.setupInstructions)
+	statusLabel.Wrapping = fyne.TextWrapBreak
+	copyStatusButton := widget.NewButton(text.copyStatusButton, func() {
+		myWindow.Clipboard().SetContent(statusLabel.Text)
+	})
+	lastSyncLabel := widget.NewLabel(formatLastSync(config.LastSyncTime, config.LastSyncStatus, text))
 	progressBar := widget.NewProgressBar()
 	progressBar.Hide()
 
-	// Проверка связи и актуальности данных
-	refreshStatusAndConnection := func() {
+	setStatus := func(status string) {
+		fyne.Do(func() { statusLabel.SetText(status) })
+	}
+	setProgress := func(value float64, visible bool) {
+		fyne.Do(func() {
+			if visible {
+				progressBar.Show()
+				progressBar.SetValue(value)
+			} else {
+				progressBar.Hide()
+			}
+		})
+	}
+	recordSync := func(status string) {
+		now := time.Now()
+		configMu.Lock()
+		config.LastSyncTime = now.Format(time.RFC3339)
+		config.LastSyncStatus = status
+		saveErr := saveConfig(config)
+		savedConfig := *config
+		configMu.Unlock()
+
+		fyne.Do(func() {
+			lastSyncLabel.SetText(formatLastSync(savedConfig.LastSyncTime, savedConfig.LastSyncStatus, text))
+			if saveErr != nil {
+				statusLabel.SetText(text.saveError + saveErr.Error())
+			}
+		})
+	}
+
+	var pullBtn *widget.Button
+	var pushBtn *widget.Button
+	var trayStatusItem *fyne.MenuItem
+	var trayAutoSyncItem *fyne.MenuItem
+	var trayMenu *fyne.Menu
+	var autoSyncCheck *widget.Check
+	var autoSyncUpdating bool
+	var setAutoSyncEnabled func(bool)
+	var requestManualSyncChoice func()
+	githubReady := make(chan struct{})
+	refreshTrayStatus := func() {
+		fyne.Do(func() {
+			cfg := getConfig()
+			trayStatusItem.Label = formatLastSync(cfg.LastSyncTime, cfg.LastSyncStatus, text)
+			trayMenu.Refresh()
+		})
+	}
+
+	persistSyncResult := func(action string, err error) {
+		var resultText, notification string
+		if err != nil {
+			resultText = text.syncFailed + err.Error()
+			notification = text.syncFailed + err.Error()
+			setStatus(resultText)
+		} else {
+			switch action {
+			case "push":
+				resultText = text.lastPushSuccess
+				notification = text.lastPushSuccess
+			case "pull":
+				resultText = text.lastPullSuccess
+				notification = text.lastPullSuccess
+			default:
+				resultText = text.statusSynced
+				notification = text.statusSynced
+			}
+			setStatus(resultText)
+		}
+		recordSync(resultText)
+		refreshTrayStatus()
+		myApp.SendNotification(fyne.NewNotification("WoWWTFSync", notification))
+	}
+
+	// All repository operations use the same lock because the worktree is shared.
+	runPush := func(cfg Config) error {
+		if cfg.GamePath == "" || cfg.RepoURL == "" || cfg.GitHubToken == "" {
+			return errors.New(text.fieldsRequired)
+		}
+		maxFileSize := int64(MaxPushFileSizeMB) * 1024 * 1024
+		sizeBytes, oversizedFiles, err := savedVariablesFileSizes(cfg.GamePath, maxFileSize)
+		if err != nil {
+			return fmt.Errorf("%s%w", text.gameReadError, err)
+		}
+		for _, file := range oversizedFiles {
+			log.Printf("WARNING: skipping file larger than %d MB: %q (%d bytes)", MaxPushFileSizeMB, file.Path, file.Size)
+		}
+		sizeMB := sizeBytes / (1024 * 1024)
+		if sizeMB > MaxFolderSizeMB {
+			return fmt.Errorf(text.folderTooLarge, sizeMB, MaxFolderSizeMB)
+		}
+		localRepoPath, err := getLocalRepoPath()
+		if err != nil {
+			return fmt.Errorf("%s%w", text.repositoryError, err)
+		}
+		if _, err := GetRepository(localRepoPath, cfg.RepoURL, cfg.GitHubToken); err != nil {
+			return fmt.Errorf("%s%w", text.repositoryError, err)
+		}
+		selectedPaths, err := listSavedVariablesFiles(cfg.GamePath)
+		if err != nil {
+			return fmt.Errorf("%s%w", text.gameReadError, err)
+		}
+		if err := copySavedVariablesFiles(cfg.GamePath, localRepoPath, maxFileSize); err != nil {
+			return fmt.Errorf("%s%w", text.gameReadError, err)
+		}
+		if err := removeTrackedFilesMissingFromSource(cfg.GamePath, localRepoPath, maxFileSize); err != nil {
+			return fmt.Errorf("%s%w", text.gameReadError, err)
+		}
+		if err := GitPush(localRepoPath, cfg.GitHubToken, "Synchronize selected folder from WoWWTFSync", selectedPaths); err != nil {
+			return fmt.Errorf("%s%w", text.pushError, err)
+		}
+		return nil
+	}
+
+	runPull := func(cfg Config, confirmOverwrite, allowDiverged bool) error {
+		if cfg.GamePath == "" || cfg.RepoURL == "" || cfg.GitHubToken == "" {
+			return errors.New(text.fieldsRequired)
+		}
+		if err := requireGameStopped(isGameRunning); err != nil {
+			return fmt.Errorf("%s%w", text.pullWhileGameOpen, err)
+		}
+		localRepoPath, err := getLocalRepoPath()
+		if err != nil {
+			return fmt.Errorf("%s%w", text.repositoryError, err)
+		}
+		if _, err := GetRepository(localRepoPath, cfg.RepoURL, cfg.GitHubToken); err != nil {
+			return fmt.Errorf("%s%w", text.repositoryError, err)
+		}
+		if err := ensureCleanWorktree(localRepoPath); err != nil {
+			return fmt.Errorf("%s%w", text.localChangesPullBlocked, err)
+		}
+		repoStatus, err := CheckRepoStatus(localRepoPath, cfg.GitHubToken)
+		if err != nil {
+			return fmt.Errorf("%s%w", text.compareError, err)
+		}
+		if !allowDiverged && (repoStatus == RepoStatusConflict || repoStatus == RepoStatusLocalNewer) {
+			return errors.New(text.pullConflict)
+		}
+		gameMatchesRepo, err := savedVariablesDirectoriesHaveSameContents(cfg.GamePath, localRepoPath, int64(MaxPushFileSizeMB)*1024*1024)
+		if err != nil {
+			return fmt.Errorf("%s%w", text.checkGameFilesError, err)
+		}
+		if !gameMatchesRepo && !confirmOverwrite {
+			return errPullConfirmationRequired
+		}
+		if err := requireGameStopped(isGameRunning); err != nil {
+			return fmt.Errorf("%s%w", text.pullWhileGameOpen, err)
+		}
+		if _, err := CreateBackup(cfg.GamePath); err != nil {
+			return fmt.Errorf("%s%w", text.backupWarning, err)
+		}
+		previousPaths, err := trackedRepositoryFiles(localRepoPath, int64(MaxPushFileSizeMB)*1024*1024)
+		if err != nil {
+			return fmt.Errorf("%s%w", text.repositoryError, err)
+		}
+		if err := GitPull(localRepoPath, cfg.GitHubToken); err != nil {
+			return fmt.Errorf("%s%w", text.pullError, err)
+		}
+		if err := copyTrackedSavedVariables(localRepoPath, cfg.GamePath, int64(MaxPushFileSizeMB)*1024*1024); err != nil {
+			return fmt.Errorf("%s%w", text.gameCopyError, err)
+		}
+		if err := removeTrackedFilesDeletedFromRepository(cfg.GamePath, localRepoPath, previousPaths, int64(MaxPushFileSizeMB)*1024*1024); err != nil {
+			return fmt.Errorf("%s%w", text.gameCopyError, err)
+		}
+		return nil
+	}
+
+	runAutomaticSync := func() {
+		cfg := getConfig()
+		if cfg.GamePath == "" || cfg.RepoURL == "" || cfg.GitHubToken == "" {
+			setStatus(text.fieldsRequired)
+			return
+		}
+
+		operationMu.Lock()
+		defer operationMu.Unlock()
+		setProgress(0.2, true)
+		defer setProgress(0, false)
+
+		localRepoPath, err := getLocalRepoPath()
+		if err != nil {
+			persistSyncResult("auto", fmt.Errorf("%s%w", text.repositoryError, err))
+			return
+		}
+		_, err = getRepositoryStatusWithRetries(
+			localRepoPath,
+			cfg.RepoURL,
+			cfg.GitHubToken,
+			gitStartupAttempts,
+			gitStartupRetryInterval,
+			waitForRetry,
+		)
+		if err != nil {
+			var repositoryErr *repositoryStatusError
+			if errors.As(err, &repositoryErr) && repositoryErr.stage == "repository" {
+				persistSyncResult("auto", fmt.Errorf("%s%w", text.repositoryError, err))
+				return
+			}
+			persistSyncResult("auto", fmt.Errorf("%s%w", text.compareError, err))
+			return
+		}
+		action, err := automaticSavedVariablesAction(cfg.GamePath, localRepoPath, int64(MaxPushFileSizeMB)*1024*1024)
+		if err != nil {
+			persistSyncResult("auto", fmt.Errorf("%s%w", text.checkGameFilesError, err))
+			return
+		}
+		setProgress(0.5, true)
+
+		switch action {
+		case autoSyncPush:
+			setStatus(text.gameSyncing)
+			err = runPush(cfg)
+			if err == nil {
+				persistSyncResult("push", nil)
+			} else {
+				persistSyncResult("push", err)
+			}
+		case autoSyncPull:
+			setStatus(text.backupCreating)
+			err = runPull(cfg, true, true)
+			if err == nil {
+				persistSyncResult("pull", nil)
+			} else {
+				persistSyncResult("pull", err)
+			}
+		case autoSyncAlreadySynced:
+			persistSyncResult("synced", nil)
+		case autoSyncConflict:
+			setStatus(text.statusConflict)
+			fyne.Do(requestManualSyncChoice)
+		}
+	}
+
+	var refreshStatusAndConnection func()
+	refreshStatusAndConnection = func() {
 		gamePath := strings.TrimSpace(gamePathEntry.Text)
 		token := strings.TrimSpace(tokenEntry.Text)
-		url := strings.TrimSpace(repoUrlEntry.Text)
-		if gamePath == "" || token == "" || url == "" {
-			fyne.Do(func() {
-				connectionLabel.SetText(text.connectionFill)
-				statusLabel.SetText(text.setupInstructions)
-			})
+		if gamePath == "" || token == "" || strings.TrimSpace(repoUrlEntry.Text) == "" {
+			connectionLabel.SetText(text.connectionFill)
+			statusLabel.SetText(text.setupInstructions)
+			return
+		}
+		url, urlErr := validateGitHubRepoURL(repoUrlEntry.Text)
+		if urlErr != nil {
+			connectionLabel.SetText(text.connectionError)
+			statusLabel.SetText(text.invalidRepoURL)
+			return
+		}
+		select {
+		case <-githubReady:
+		default:
+			connectionLabel.SetText(text.githubWaiting)
+			statusLabel.SetText(text.githubWaiting)
 			return
 		}
 
 		go func() {
-			isTokenOk := CheckTokenValid(token)
-			isRepoOk := CheckRepoValid(url, token)
-
+			isTokenOK := CheckTokenValid(token)
+			isRepoOK := CheckRepoValid(url, token)
 			fyne.Do(func() {
-				if !isTokenOk || !isRepoOk {
+				if !isTokenOK || !isRepoOK {
 					connectionLabel.SetText(text.connectionError)
 					statusLabel.SetText(text.syncUnavailable)
 					return
 				}
 				connectionLabel.SetText(text.connectionConnected)
 			})
+			if !isTokenOK || !isRepoOK {
+				return
+			}
 
-			// Если связь есть, проверяем где данные новее
-			if isTokenOk && isRepoOk {
-				if _, err := GetRepository(LocalRepoFolder, url, token); err != nil {
-					fyne.Do(func() {
-						statusLabel.SetText(text.openRepoError + err.Error())
-					})
+			operationMu.Lock()
+			defer operationMu.Unlock()
+			localRepoPath, err := getLocalRepoPath()
+			if err != nil {
+				setStatus(text.openRepoError + err.Error())
+				return
+			}
+			st, err := getRepositoryStatusWithRetries(
+				localRepoPath,
+				url,
+				token,
+				gitStartupAttempts,
+				gitStartupRetryInterval,
+				waitForRetry,
+			)
+			if err != nil {
+				var repositoryErr *repositoryStatusError
+				if errors.As(err, &repositoryErr) && repositoryErr.stage == "repository" {
+					setStatus(text.openRepoError + err.Error())
 					return
 				}
-				if err := CopyDir(gamePath, LocalRepoFolder); err != nil {
-					fyne.Do(func() {
-						statusLabel.SetText(text.checkGameFilesError + err.Error())
-					})
-					return
-				}
-
-				st, err := CheckRepoStatus(LocalRepoFolder, token)
-				if err != nil {
-					fyne.Do(func() {
-						statusLabel.SetText(text.compareError + err.Error())
-					})
-					return
-				}
-
-				fyne.Do(func() {
-					switch st {
-					case RepoStatusCloudNewer:
-						statusLabel.SetText(text.statusCloudNewer)
-					case RepoStatusLocalNewer:
-						statusLabel.SetText(text.statusLocalNewer)
-					case RepoStatusConflict:
-						statusLabel.SetText(text.statusConflict)
-					case RepoStatusSynced:
-						statusLabel.SetText(text.statusSynced)
-					}
-				})
+				setStatus(text.compareError + err.Error())
+				return
+			}
+			switch st {
+			case RepoStatusCloudNewer:
+				setStatus(text.statusCloudNewer)
+			case RepoStatusLocalNewer:
+				setStatus(text.statusLocalNewer)
+			case RepoStatusConflict:
+				setStatus(text.statusConflict)
+			case RepoStatusSynced:
+				setStatus(text.statusSynced)
 			}
 		}()
 	}
 
-	// Авто-проверка при вводе с задержкой
 	var checkTimer *time.Timer
 	onFieldChanged := func(string) {
 		if checkTimer != nil {
@@ -138,11 +406,9 @@ func main() {
 			fyne.Do(refreshStatusAndConnection)
 		})
 	}
-
 	repoUrlEntry.OnChanged = onFieldChanged
 	tokenEntry.OnChanged = onFieldChanged
 
-	// Кнопка выбора папки через проводник
 	browseBtn := widget.NewButton(text.browseButton, func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err == nil && uri != nil {
@@ -150,144 +416,284 @@ func main() {
 			}
 		}, myWindow)
 	})
-
-	var pullBtn *widget.Button
-	var pushBtn *widget.Button
-
-	// Кнопка сохранения настроек
-	saveConfigBtn := widget.NewButton(text.saveSettings, func() {
-		cleanURL := strings.TrimSpace(repoUrlEntry.Text)
-		if cleanURL != "" && !strings.HasSuffix(cleanURL, ".git") {
-			cleanURL += ".git"
-			repoUrlEntry.SetText(cleanURL)
+	startMinimizedCheck := widget.NewCheck(text.startMinimized, func(checked bool) {
+		configMu.Lock()
+		config.StartMinimized = checked
+		saveErr := saveConfig(config)
+		configMu.Unlock()
+		if saveErr != nil {
+			setStatus(text.saveError + saveErr.Error())
 		}
-
-		config.GamePath = gamePathEntry.Text
-		config.RepoURL = cleanURL
-		config.GitHubToken = tokenEntry.Text
-
-		if err := saveConfig(config); err != nil {
-			statusLabel.SetText(text.saveError + err.Error())
+	})
+	startMinimizedCheck.SetChecked(config.StartMinimized)
+	autoSyncCheck = widget.NewCheck(text.autoSync, func(checked bool) {
+		if autoSyncUpdating {
 			return
 		}
-		statusLabel.SetText(text.settingsSaved)
+		if setAutoSyncEnabled != nil {
+			setAutoSyncEnabled(checked)
+		}
+	})
+	autoSyncUpdating = true
+	autoSyncCheck.SetChecked(config.AutoSync)
+	autoSyncUpdating = false
+	autostartUpdating := false
+	var autostartCheck *widget.Check
+	autostartCheck = widget.NewCheck(text.autostart, func(checked bool) {
+		if autostartUpdating {
+			return
+		}
+		if err := setAutostart(checked); err != nil {
+			autostartUpdating = true
+			autostartCheck.SetChecked(!checked)
+			autostartUpdating = false
+			setStatus(text.autostartError + err.Error())
+			return
+		}
+
+		configMu.Lock()
+		previous := config.Autostart
+		config.Autostart = checked
+		saveErr := saveConfig(config)
+		if saveErr != nil {
+			config.Autostart = previous
+		}
+		configMu.Unlock()
+		if saveErr != nil {
+			rollbackErr := setAutostart(previous)
+			autostartUpdating = true
+			autostartCheck.SetChecked(previous)
+			autostartUpdating = false
+			if rollbackErr != nil {
+				setStatus(text.saveError + saveErr.Error() + "; " + text.autostartError + rollbackErr.Error())
+				return
+			}
+			setStatus(text.saveError + saveErr.Error())
+		}
+	})
+	autostartCheck.SetChecked(config.Autostart)
+
+	saveConfigBtn := widget.NewButton(text.refreshConfiguration, func() {
+		cleanURL := strings.TrimSpace(repoUrlEntry.Text)
+		if cleanURL != "" {
+			normalizedURL, err := validateGitHubRepoURL(cleanURL)
+			if err != nil {
+				setStatus(text.invalidRepoURL)
+				return
+			}
+			cleanURL = normalizedURL
+			repoUrlEntry.SetText(cleanURL)
+		}
+		configMu.Lock()
+		config.GamePath = strings.TrimSpace(gamePathEntry.Text)
+		config.RepoURL = cleanURL
+		config.GitHubToken = strings.TrimSpace(tokenEntry.Text)
+		config.StartMinimized = startMinimizedCheck.Checked
+		config.AutoSync = autoSyncCheck.Checked
+		config.Autostart = autostartCheck.Checked
+		saveErr := saveConfig(config)
+		configMu.Unlock()
+		if saveErr != nil {
+			setStatus(text.saveError + saveErr.Error())
+			return
+		}
+		setStatus(text.settingsSaved)
 		refreshStatusAndConnection()
 	})
 
-	// Кнопка Pull (Скачать)
-	pullBtn = widget.NewButton(text.pullButton, func() {
-		if config.GamePath == "" || config.RepoURL == "" || config.GitHubToken == "" {
-			statusLabel.SetText(text.fieldsRequired)
-			return
-		}
-
-		pullBtn.Disable()
-		pushBtn.Disable()
-		progressBar.Show()
-		progressBar.SetValue(0.1)
-		statusLabel.SetText(text.backupCreating)
-
-		go func() {
-			defer func() {
+	setOperationBusy := func(busy bool) {
+		fyne.Do(func() {
+			if busy {
+				pullBtn.Disable()
+				pushBtn.Disable()
+				progressBar.Show()
+				progressBar.SetValue(0.1)
+			} else {
 				pullBtn.Enable()
 				pushBtn.Enable()
 				progressBar.Hide()
+			}
+		})
+	}
+	completeManualOperation := func(action string, err error) {
+		persistSyncResult(action, err)
+		setOperationBusy(false)
+	}
+	confirmedPull := func(cfg Config, allowDiverged bool) {
+		dialog.ShowConfirm(text.pullConfirmTitle, text.pullConfirmation, func(confirmed bool) {
+			if !confirmed {
+				setOperationBusy(false)
+				return
+			}
+			go func() {
+				operationMu.Lock()
+				err := runPull(cfg, true, allowDiverged)
+				operationMu.Unlock()
+				completeManualOperation("pull", err)
 			}()
-
-			_, err := CreateBackup(config.GamePath)
-			if err != nil {
-				statusLabel.SetText(text.backupWarning + err.Error())
+		}, myWindow)
+	}
+	var startManualOperation func(action string, allowDiverged bool)
+	startManualOperation = func(action string, allowDiverged bool) {
+		setOperationBusy(true)
+		go func() {
+			operationMu.Lock()
+			setProgress(0.2, true)
+			cfg := getConfig()
+			var err error
+			if action == "pull" {
+				err = runPull(cfg, false, allowDiverged)
+			} else {
+				err = runPush(cfg)
 			}
-			progressBar.SetValue(0.3)
-
-			statusLabel.SetText(text.repositoryConnecting)
-			_, err = GetRepository(LocalRepoFolder, config.RepoURL, config.GitHubToken)
-			if err != nil {
-				statusLabel.SetText(text.repositoryError + err.Error())
+			operationMu.Unlock()
+			if errors.Is(err, errPullConfirmationRequired) {
+				fyne.Do(func() { confirmedPull(cfg, allowDiverged) })
 				return
 			}
-			progressBar.SetValue(0.5)
-
-			statusLabel.SetText(text.pullDownloading)
-			err = GitPull(LocalRepoFolder, config.GitHubToken)
-			if err != nil {
-				statusLabel.SetText(text.pullError + err.Error())
-				return
-			}
-			progressBar.SetValue(0.8)
-
-			statusLabel.SetText(text.gameUpdating)
-			err = CopyDir(LocalRepoFolder, config.GamePath)
-			if err != nil {
-				statusLabel.SetText(text.gameCopyError + err.Error())
-				return
-			}
-
-			progressBar.SetValue(1.0)
-			time.Sleep(300 * time.Millisecond)
-			statusLabel.SetText(text.pullComplete)
+			completeManualOperation(action, err)
 		}()
-	})
-
-	// Кнопка Push (Загрузить)
-	pushBtn = widget.NewButton(text.pushButton, func() {
-		if config.GamePath == "" || config.RepoURL == "" || config.GitHubToken == "" {
-			statusLabel.SetText(text.fieldsRequired)
-			return
-		}
-
-		sizeBytes, err := GetFolderSize(config.GamePath)
+	}
+	requestManualSyncChoice = func() {
+		var choiceDialog *dialog.CustomDialog
+		pushChoice := widget.NewButton(text.pushButton, func() {
+			choiceDialog.Hide()
+			startManualOperation("push", false)
+		})
+		pullChoice := widget.NewButton(text.pullButton, func() {
+			choiceDialog.Hide()
+			startManualOperation("pull", true)
+		})
+		content := container.NewVBox(
+			widget.NewLabel(text.syncChoicePrompt),
+			container.NewGridWithColumns(2, pushChoice, pullChoice),
+		)
+		choiceDialog = dialog.NewCustom(text.syncChoiceTitle, text.cancelButton, content, myWindow)
+		choiceDialog.Show()
+	}
+	pullBtn = widget.NewButton(text.pullButton, func() { startManualOperation("pull", false) })
+	pushBtn = widget.NewButton(text.pushButton, func() { startManualOperation("push", false) })
+	openBackupsButton := widget.NewButton(text.openBackups, func() {
+		backupDir, err := getBackupDirectory()
 		if err == nil {
-			sizeMB := sizeBytes / (1024 * 1024)
-			if sizeMB > MaxFolderSizeMB {
-				statusLabel.SetText(fmt.Sprintf(text.folderTooLarge, sizeMB, MaxFolderSizeMB))
-				return
-			}
+			err = openBackupDirectory(backupDir)
 		}
-
-		pullBtn.Disable()
-		pushBtn.Disable()
-		progressBar.Show()
-		progressBar.SetValue(0.2)
-		statusLabel.SetText(text.folderPreparing)
-
-		go func() {
-			defer func() {
-				pullBtn.Enable()
-				pushBtn.Enable()
-				progressBar.Hide()
-			}()
-
-			_, err := GetRepository(LocalRepoFolder, config.RepoURL, config.GitHubToken)
+		if err != nil {
+			setStatus(text.backupOpenError + err.Error())
+		}
+	})
+	restoreBackupButton := widget.NewButton(text.restoreBackup, func() {
+		fileDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 			if err != nil {
-				statusLabel.SetText(text.repositoryError + err.Error())
+				setStatus(text.backupSelectError + err.Error())
 				return
 			}
-			progressBar.SetValue(0.4)
-
-			statusLabel.SetText(text.gameSyncing)
-			err = CopyDir(config.GamePath, LocalRepoFolder)
-			if err != nil {
-				statusLabel.SetText(text.gameReadError + err.Error())
+			if reader == nil {
 				return
 			}
-			progressBar.SetValue(0.7)
-
-			statusLabel.SetText(text.pushSending)
-			err = GitPush(LocalRepoFolder, config.GitHubToken, "Update SavedVariables from GUI launcher")
-			if err != nil {
-				statusLabel.SetText(text.pushError + err.Error())
+			archivePath := reader.URI().Path()
+			if err := reader.Close(); err != nil {
+				setStatus(text.backupSelectError + err.Error())
 				return
 			}
-
-			progressBar.SetValue(1.0)
-			time.Sleep(300 * time.Millisecond)
-			statusLabel.SetText(text.pushComplete)
-		}()
+			dialog.ShowConfirm(text.restoreBackup, text.backupRestoreConfirm, func(confirmed bool) {
+				if !confirmed {
+					return
+				}
+				go func() {
+					operationMu.Lock()
+					err := requireGameStopped(isGameRunning)
+					if err == nil {
+						_, err = RestoreBackup(archivePath, getConfig().GamePath)
+					}
+					operationMu.Unlock()
+					if err != nil {
+						setStatus(text.backupWarning + err.Error())
+						return
+					}
+					setStatus(text.backupRestoreSuccess)
+				}()
+			}, myWindow)
+		}, myWindow)
+		fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".zip"}))
+		fileDialog.Show()
 	})
 
-	// Первичная проверка при старте
-	refreshStatusAndConnection()
+	showWindowItem := fyne.NewMenuItem(text.showWindow, myWindow.Show)
+	pushMenuItem := fyne.NewMenuItem(text.pushButton, func() { startManualOperation("push", false) })
+	pullMenuItem := fyne.NewMenuItem(text.pullButton, func() { startManualOperation("pull", false) })
+	trayAutoSyncItem = fyne.NewMenuItem(autoSyncMenuLabel(config.AutoSync, text.autoSync), func() {
+		setAutoSyncEnabled(!getConfig().AutoSync)
+	})
+	aboutMenuItem := fyne.NewMenuItem(text.about, func() {
+		repositoryURL, err := url.Parse("https://github.com/LipsOfJolie/wow-wtf-sync")
+		if err != nil {
+			setStatus(text.openRepoError + err.Error())
+			return
+		}
+		if err := myApp.OpenURL(repositoryURL); err != nil {
+			setStatus(text.openRepoError + err.Error())
+		}
+	})
+	trayStatusItem = fyne.NewMenuItem(formatLastSync(config.LastSyncTime, config.LastSyncStatus, text), nil)
+	trayStatusItem.Disabled = true
+	quitMenuItem := fyne.NewMenuItem(text.quit, myApp.Quit)
+	quitMenuItem.IsQuit = true
+	trayMenu = fyne.NewMenu("WoWWTFSync",
+		showWindowItem,
+		pushMenuItem,
+		pullMenuItem,
+		trayAutoSyncItem,
+		fyne.NewMenuItemSeparator(),
+		trayStatusItem,
+		fyne.NewMenuItemSeparator(),
+		aboutMenuItem,
+		fyne.NewMenuItemSeparator(),
+		quitMenuItem,
+	)
+	setAutoSyncEnabled = func(enabled bool) {
+		configMu.Lock()
+		previous := config.AutoSync
+		config.AutoSync = enabled
+		saveErr := saveConfig(config)
+		if saveErr != nil {
+			config.AutoSync = previous
+		}
+		actual := config.AutoSync
+		configMu.Unlock()
+
+		fyne.Do(func() {
+			autoSyncUpdating = true
+			autoSyncCheck.SetChecked(actual)
+			autoSyncUpdating = false
+			trayAutoSyncItem.Label = autoSyncMenuLabel(actual, text.autoSync)
+			trayMenu.Refresh()
+		})
+		if saveErr != nil {
+			setStatus(text.saveError + saveErr.Error())
+		}
+	}
+	if desktopApp, ok := myApp.(desktop.App); ok {
+		desktopApp.SetSystemTrayMenu(trayMenu)
+		desktopApp.SetSystemTrayWindow(myWindow)
+	}
+	var trayClickMu sync.Mutex
+	var lastTrayClick time.Time
+	systray.SetOnTapped(func() {
+		trayClickMu.Lock()
+		now := time.Now()
+		doubleClick := !lastTrayClick.IsZero() && now.Sub(lastTrayClick) <= 500*time.Millisecond
+		if doubleClick {
+			lastTrayClick = time.Time{}
+		} else {
+			lastTrayClick = now
+		}
+		trayClickMu.Unlock()
+		if doubleClick {
+			fyne.Do(myWindow.Show)
+		}
+	})
+	myWindow.SetCloseIntercept(myWindow.Hide)
 
 	formContainer := container.NewVBox(
 		widget.NewLabel(text.gamePathLabel),
@@ -296,54 +702,75 @@ func main() {
 		repoUrlEntry,
 		widget.NewLabel(text.tokenLabel),
 		tokenEntry,
-		connectionLabel, // Компактный индикатор связи
+		connectionLabel,
+		container.NewVBox(startMinimizedCheck, autoSyncCheck, autostartCheck),
 		saveConfigBtn,
 		widget.NewSeparator(),
-		statusLabel, // Статус актуальности данных (где новее)
+		statusLabel,
+		copyStatusButton,
 		progressBar,
 		widget.NewSeparator(),
 		container.NewGridWithColumns(2, pullBtn, pushBtn),
+		container.NewGridWithColumns(2, openBackupsButton, restoreBackupButton),
+		widget.NewSeparator(),
+		lastSyncLabel,
 	)
-
 	myWindow.SetContent(formContainer)
-	myWindow.ShowAndRun()
+
+	refreshStatusAndConnection()
+	if configLoadError != nil && !errors.Is(configLoadError, os.ErrNotExist) {
+		setStatus(text.loadConfigError + configLoadError.Error())
+	}
+	go monitorGitHubAvailability(
+		getConfig,
+		githubReady,
+		func() { fyne.Do(refreshStatusAndConnection) },
+		func() {
+			fyne.Do(func() {
+				connectionLabel.SetText(text.githubWaiting)
+				statusLabel.SetText(text.githubWaiting)
+			})
+		},
+		isGitHubReachable,
+	)
+	go monitorAutoSyncWithProbe(getConfig, runAutomaticSync, setStatus, text, isGameRunning, config.AutoSync, githubReady)
+	if config.StartMinimized {
+		myApp.Run()
+	} else {
+		myWindow.ShowAndRun()
+	}
 }
 
-// Получаем путь к папке, где реально лежит запущенный .exe файл
-func getConfigPath() string {
-	exePath, err := os.Executable()
-	if err != nil {
-		return ConfigFileName // запасной вариант
+func autoSyncMenuLabel(enabled bool, label string) string {
+	if enabled {
+		return "☑ " + label
 	}
-	return filepath.Join(filepath.Dir(exePath), ConfigFileName)
+	return "☐ " + label
 }
 
-func loadConfig() (*Config, error) {
-	configPath := getConfigPath()
-	if _, err := os.Stat(configPath); err != nil {
-		return nil, err
+func formatLastSync(timestamp, status string, text uiText) string {
+	if timestamp == "" || status == "" {
+		return text.lastSyncNever
 	}
-	file, err := os.Open(configPath)
+	parsed, err := time.Parse(time.RFC3339, timestamp)
 	if err != nil {
-		return nil, err
+		return fmt.Sprintf("%s. %s%s", status, text.lastSyncLabel, timestamp)
 	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	config := &Config{}
-	err = decoder.Decode(config)
-	return config, err
+	return fmt.Sprintf("%s. %s%s", status, text.lastSyncLabel, parsed.Local().Format("02.01.2006 15:04"))
 }
 
-func saveConfig(config *Config) error {
-	configPath := getConfigPath()
-	file, err := os.Create(configPath)
+func getLocalRepoPath() (string, error) {
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return err
+		return "", fmt.Errorf("не удалось определить папку данных пользователя: %w", err)
 	}
-	defer file.Close()
 
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(config)
+	localRepoPath := filepath.Join(cacheDir, "WoWWTFSync", LocalRepoFolder)
+	if err := rejectUnsafePathComponents(filepath.Dir(localRepoPath)); err != nil {
+		return "", fmt.Errorf("unsafe application cache directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(localRepoPath), 0700); err != nil {
+		return "", fmt.Errorf("не удалось создать папку данных приложения %q: %w", filepath.Dir(localRepoPath), err)
+	}
+	return localRepoPath, nil
 }

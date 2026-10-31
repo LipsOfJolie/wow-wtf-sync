@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,8 +13,17 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	gitclient "github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 )
+
+const gitNetworkTimeout = 60 * time.Second
+const gitStartupAttempts = 3
+const gitStartupRetryInterval = 5 * time.Second
+
+func init() {
+	gitclient.InstallProtocol("https", githttp.NewClient(&http.Client{Timeout: gitNetworkTimeout}))
+}
 
 const (
 	RepoStatusCloudNewer = "cloud_newer"
@@ -36,20 +47,18 @@ func CheckTokenValid(token string) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode == 200
+	closeErr := resp.Body.Close()
+	return resp.StatusCode == http.StatusOK && closeErr == nil
 }
 
 // Проверка существования репозитория через GitHub API
 func CheckRepoValid(repoURL string, token string) bool {
-	cleanURL := strings.TrimSuffix(strings.TrimSpace(repoURL), "/")
-	cleanURL = strings.TrimSuffix(cleanURL, ".git")
-	parts := strings.Split(cleanURL, "github.com/")
-	if len(parts) < 2 {
+	cleanURL, err := validateGitHubRepoURL(repoURL)
+	if err != nil {
 		return false
 	}
-
-	apiURL := "https://api.github.com/repos/" + parts[1]
+	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(cleanURL, "https://github.com/"), ".git"), "/")
+	apiURL := "https://api.github.com/repos/" + url.PathEscape(parts[0]) + "/" + url.PathEscape(parts[1])
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return false
@@ -62,28 +71,24 @@ func CheckRepoValid(repoURL string, token string) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode == 200
-}
-
-// Подсчет размера папки в байтах
-func GetFolderSize(path string) (int64, error) {
-	var size int64
-	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			size += info.Size()
-		}
-		return nil
-	})
-	return size, err
+	closeErr := resp.Body.Close()
+	return resp.StatusCode == http.StatusOK && closeErr == nil
 }
 
 // Получение или клонирование репозитория
 func GetRepository(localPath string, repoURL string, token string) (*git.Repository, error) {
+	repoURL, err := validateGitHubRepoURL(repoURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectUnsafePathComponents(localPath); err != nil {
+		return nil, err
+	}
+
 	dotGitPath := filepath.Join(localPath, ".git")
+	if err := rejectUnsafePathComponents(dotGitPath); err != nil {
+		return nil, fmt.Errorf("local repository metadata path is unsafe: %w", err)
+	}
 
 	var auth *githttp.BasicAuth
 	if token != "" {
@@ -93,16 +98,134 @@ func GetRepository(localPath string, repoURL string, token string) (*git.Reposit
 		}
 	}
 
-	if _, err := os.Stat(dotGitPath); os.IsNotExist(err) {
-		_ = os.RemoveAll(localPath)
-
+	if _, err := os.Stat(dotGitPath); errors.Is(err, os.ErrNotExist) {
+		if _, statErr := os.Stat(localPath); statErr == nil {
+			backupPath, preserveErr := preserveLocalRepository(localPath, "uninitialized")
+			if preserveErr != nil {
+				return nil, preserveErr
+			}
+			return nil, &repositoryPreservedError{path: backupPath}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, statErr
+		}
 		return git.PlainClone(localPath, false, &git.CloneOptions{
 			URL:  repoURL,
 			Auth: auth,
 		})
+	} else if err != nil {
+		return nil, err
 	}
 
-	return git.PlainOpen(localPath)
+	repo, err := git.PlainOpen(localPath)
+	if err != nil {
+		backupPath, preserveErr := preserveLocalRepository(localPath, "damaged")
+		if preserveErr != nil {
+			return nil, fmt.Errorf("local repository is damaged (%v); could not preserve it: %w", err, preserveErr)
+		}
+		return nil, &repositoryPreservedError{path: backupPath}
+	}
+	if err := repositoryOriginMatches(repo, repoURL); err != nil {
+		backupPath, preserveErr := preserveLocalRepository(localPath, "repository-changed")
+		if preserveErr != nil {
+			return nil, fmt.Errorf("%w; preservation failed: %v", err, preserveErr)
+		}
+		return nil, &repositoryPreservedError{path: backupPath}
+	}
+	return repo, nil
+}
+
+func repositoryOriginMatches(repo *git.Repository, configuredURL string) error {
+	remote, err := repo.Remote("origin")
+	if err != nil {
+		return fmt.Errorf("local repository has no origin remote; refusing to use it")
+	}
+	remoteConfig := remote.Config()
+	if len(remoteConfig.URLs) != 1 {
+		return fmt.Errorf("local repository has an ambiguous origin; refusing to use it")
+	}
+	originURL, err := validateGitHubRepoURL(remoteConfig.URLs[0])
+	if err != nil || originURL != configuredURL {
+		return fmt.Errorf("local repository origin does not match the configured repository")
+	}
+	return nil
+}
+
+type repositoryPreservedError struct {
+	path string
+}
+
+func (err *repositoryPreservedError) Error() string {
+	return fmt.Sprintf("local repository data was preserved at %q; retry to use the configured repository", err.path)
+}
+
+func preserveLocalRepository(localPath, reason string) (string, error) {
+	parent := filepath.Dir(localPath)
+	base := filepath.Base(localPath)
+	for attempt := 0; attempt < 100; attempt++ {
+		suffix := time.Now().Format("20060102-150405.000000000")
+		if attempt > 0 {
+			suffix += fmt.Sprintf("-%d", attempt)
+		}
+		backupPath := filepath.Join(parent, base+"."+reason+"."+suffix)
+		if _, err := os.Lstat(backupPath); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		if err := os.Rename(localPath, backupPath); err != nil {
+			return "", err
+		}
+		return backupPath, nil
+	}
+	return "", fmt.Errorf("could not find an unused backup name for local repository")
+}
+
+func getRepositoryStatusWithRetries(localPath, repoURL, token string, attempts int, interval time.Duration, wait func(time.Duration)) (string, error) {
+	return retryRepositoryStatus(attempts, interval, wait, func() (string, error) {
+		if _, err := GetRepository(localPath, repoURL, token); err != nil {
+			return "", &repositoryStatusError{stage: "repository", err: err}
+		}
+		status, err := CheckRepoStatus(localPath, token)
+		if err != nil {
+			return "", &repositoryStatusError{stage: "status", err: err}
+		}
+		return status, nil
+	})
+}
+
+type repositoryStatusError struct {
+	stage string
+	err   error
+}
+
+func (err *repositoryStatusError) Error() string {
+	return err.err.Error()
+}
+
+func (err *repositoryStatusError) Unwrap() error {
+	return err.err
+}
+
+func retryRepositoryStatus(attempts int, interval time.Duration, wait func(time.Duration), check func() (string, error)) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		status, err := check()
+		if err == nil {
+			return status, nil
+		}
+		lastErr = err
+		var preservedErr *repositoryPreservedError
+		if errors.As(err, &preservedErr) {
+			break
+		}
+		if attempt+1 < attempts {
+			wait(interval)
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("попытки подключения к репозиторию не выполнялись")
+	}
+	return "", lastErr
 }
 
 // Git Pull (скачивание изменений)
@@ -116,6 +239,13 @@ func GitPull(localPath string, token string) error {
 	if err != nil {
 		return err
 	}
+	status, err := worktree.Status()
+	if err != nil {
+		return err
+	}
+	if !status.IsClean() {
+		return errors.New("local Git working copy has uncommitted changes; Pull was cancelled")
+	}
 
 	var auth *githttp.BasicAuth
 	if token != "" {
@@ -128,7 +258,6 @@ func GitPull(localPath string, token string) error {
 	err = worktree.Pull(&git.PullOptions{
 		RemoteName: "origin",
 		Auth:       auth,
-		Force:      true,
 	})
 
 	if err == git.NoErrAlreadyUpToDate {
@@ -137,8 +266,27 @@ func GitPull(localPath string, token string) error {
 	return err
 }
 
+func ensureCleanWorktree(localPath string) error {
+	repo, err := git.PlainOpen(localPath)
+	if err != nil {
+		return err
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+	status, err := worktree.Status()
+	if err != nil {
+		return err
+	}
+	if !status.IsClean() {
+		return errors.New("local Git working copy has uncommitted changes")
+	}
+	return nil
+}
+
 // Git Push (отправка изменений)
-func GitPush(localPath string, token string, message string) error {
+func GitPush(localPath string, token string, message string, selectedPaths []string) error {
 	repo, err := git.PlainOpen(localPath)
 	if err != nil {
 		return err
@@ -149,9 +297,58 @@ func GitPush(localPath string, token string, message string) error {
 		return err
 	}
 
-	_, err = worktree.Add(".")
+	trackedPaths, err := trackedRepositoryFiles(localPath, int64(MaxPushFileSizeMB)*1024*1024)
 	if err != nil {
 		return err
+	}
+	status, err := worktree.Status()
+	if err != nil {
+		return err
+	}
+	for path, fileStatus := range status {
+		if fileStatus.Staging != git.Unmodified {
+			if err := worktree.Reset(&git.ResetOptions{Mode: git.MixedReset, Files: []string{filepath.ToSlash(path)}}); err != nil {
+				return fmt.Errorf("unstage local change at %q before synchronizing: %w", path, err)
+			}
+		}
+	}
+
+	pathsToStage := make(map[string]struct{}, len(selectedPaths)+len(trackedPaths))
+	trackedPathSet := make(map[string]struct{}, len(trackedPaths))
+	for _, path := range selectedPaths {
+		pathsToStage[filepath.ToSlash(path)] = struct{}{}
+	}
+	for _, path := range trackedPaths {
+		path = filepath.ToSlash(path)
+		pathsToStage[path] = struct{}{}
+		trackedPathSet[path] = struct{}{}
+	}
+	for path := range pathsToStage {
+		fullPath, err := securePathUnder(localPath, filepath.FromSlash(path))
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(fullPath)
+		if errors.Is(err, os.ErrNotExist) {
+			if _, wasTracked := trackedPathSet[path]; wasTracked {
+				if _, err := worktree.Remove(path); err != nil {
+					return fmt.Errorf("stage removal of %q: %w", path, err)
+				}
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || isReparsePoint(info) || !info.Mode().IsRegular() {
+			return fmt.Errorf("selected-folder file is not regular: %q", path)
+		}
+		if info.Size() > int64(MaxPushFileSizeMB)*1024*1024 {
+			continue
+		}
+		if _, err := worktree.Add(path); err != nil {
+			return fmt.Errorf("stage selected-folder file %q: %w", path, err)
+		}
 	}
 
 	_, err = worktree.Commit(message, &git.CommitOptions{
@@ -163,8 +360,11 @@ func GitPush(localPath string, token string, message string) error {
 	})
 	if err != nil {
 		status, statusErr := worktree.Status()
-		if statusErr == nil && status.IsClean() {
-			return nil
+		if statusErr != nil {
+			return fmt.Errorf("не удалось проверить изменения после ошибки commit: %w", statusErr)
+		}
+		if !status.IsClean() {
+			return err
 		}
 	}
 
@@ -220,7 +420,6 @@ func CheckRepoStatus(localPath string, token string) (string, error) {
 	err = repo.Fetch(&git.FetchOptions{
 		RemoteName: branch.Remote,
 		Auth:       auth,
-		Force:      true,
 	})
 	if err != nil && err != git.NoErrAlreadyUpToDate {
 		return "", fmt.Errorf("не удалось получить статус удаленного репозитория: %w", err)
