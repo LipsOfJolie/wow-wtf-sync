@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -12,6 +13,15 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
+
+func TestIsRepositoryTimeout(t *testing.T) {
+	if !isRepositoryTimeout(errors.Join(errors.New("remote status failed"), context.DeadlineExceeded)) {
+		t.Fatal("expected wrapped deadline to be recognized as a repository timeout")
+	}
+	if isRepositoryTimeout(errors.New("repository not found")) {
+		t.Fatal("non-timeout error was recognized as a repository timeout")
+	}
+}
 
 func TestClassifyRepoStatus(t *testing.T) {
 	tests := []struct {

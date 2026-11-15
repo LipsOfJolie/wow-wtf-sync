@@ -81,17 +81,24 @@ func main() {
 	tokenEntry.SetText(config.GitHubToken)
 
 	connectionLabel := widget.NewLabel(text.connectionChecking)
-	statusLabel := widget.NewLabel(text.setupInstructions)
+	statusLabel := widget.NewLabel(formatStatusWithHistory(
+		text.setupInstructions,
+		config.LastSyncTime,
+		config.LastSyncStatus,
+		text,
+	))
 	statusLabel.Wrapping = fyne.TextWrapBreak
 	copyStatusButton := widget.NewButton(text.copyStatusButton, func() {
 		myWindow.Clipboard().SetContent(statusLabel.Text)
 	})
-	lastSyncLabel := widget.NewLabel(formatLastSync(config.LastSyncTime, config.LastSyncStatus, text))
 	progressBar := widget.NewProgressBar()
 	progressBar.Hide()
 
 	setStatus := func(status string) {
-		fyne.Do(func() { statusLabel.SetText(status) })
+		fyne.Do(func() {
+			cfg := getConfig()
+			statusLabel.SetText(formatStatusWithHistory(status, cfg.LastSyncTime, cfg.LastSyncStatus, text))
+		})
 	}
 	setProgress := func(value float64, visible bool) {
 		fyne.Do(func() {
@@ -103,7 +110,7 @@ func main() {
 			}
 		})
 	}
-	recordSync := func(status string) {
+	recordStatus := func(status string) {
 		now := time.Now()
 		configMu.Lock()
 		config.LastSyncTime = now.Format(time.RFC3339)
@@ -113,9 +120,9 @@ func main() {
 		configMu.Unlock()
 
 		fyne.Do(func() {
-			lastSyncLabel.SetText(formatLastSync(savedConfig.LastSyncTime, savedConfig.LastSyncStatus, text))
+			statusLabel.SetText(formatStatusWithHistory(status, savedConfig.LastSyncTime, savedConfig.LastSyncStatus, text))
 			if saveErr != nil {
-				statusLabel.SetText(text.saveError + saveErr.Error())
+				statusLabel.SetText(formatStatusWithHistory(text.saveError+saveErr.Error(), savedConfig.LastSyncTime, savedConfig.LastSyncStatus, text))
 			}
 		})
 	}
@@ -158,8 +165,10 @@ func main() {
 			}
 			setStatus(resultText)
 		}
-		recordSync(resultText)
-		refreshTrayStatus()
+		if err == nil {
+			recordStatus(resultText)
+			refreshTrayStatus()
+		}
 		myApp.SendNotification(fyne.NewNotification("WoWWTFSync", notification))
 	}
 
@@ -256,7 +265,8 @@ func main() {
 		return nil
 	}
 
-	runAutomaticSync := func() {
+	var runAutomaticSync func()
+	runAutomaticSync = func() {
 		cfg := getConfig()
 		if cfg.GamePath == "" || cfg.RepoURL == "" || cfg.GitHubToken == "" {
 			setStatus(text.fieldsRequired)
@@ -284,7 +294,25 @@ func main() {
 		if err != nil {
 			var repositoryErr *repositoryStatusError
 			if errors.As(err, &repositoryErr) && repositoryErr.stage == "repository" {
+				if isRepositoryTimeout(err) {
+					setStatus(text.retryingConnection)
+					time.AfterFunc(repositoryRetryInterval, func() {
+						if getConfig().AutoSync {
+							go runAutomaticSync()
+						}
+					})
+					return
+				}
 				persistSyncResult("auto", fmt.Errorf("%s%w", text.repositoryError, err))
+				return
+			}
+			if isRepositoryTimeout(err) {
+				setStatus(text.retryingConnection)
+				time.AfterFunc(repositoryRetryInterval, func() {
+					if getConfig().AutoSync {
+						go runAutomaticSync()
+					}
+				})
 				return
 			}
 			persistSyncResult("auto", fmt.Errorf("%s%w", text.compareError, err))
@@ -328,20 +356,20 @@ func main() {
 		token := strings.TrimSpace(tokenEntry.Text)
 		if gamePath == "" || token == "" || strings.TrimSpace(repoUrlEntry.Text) == "" {
 			connectionLabel.SetText(text.connectionFill)
-			statusLabel.SetText(text.setupInstructions)
+			setStatus(text.setupInstructions)
 			return
 		}
 		url, urlErr := validateGitHubRepoURL(repoUrlEntry.Text)
 		if urlErr != nil {
 			connectionLabel.SetText(text.connectionError)
-			statusLabel.SetText(text.invalidRepoURL)
+			setStatus(text.invalidRepoURL)
 			return
 		}
 		select {
 		case <-githubReady:
 		default:
 			connectionLabel.SetText(text.githubWaiting)
-			statusLabel.SetText(text.githubWaiting)
+			setStatus(text.githubWaiting)
 			return
 		}
 
@@ -351,7 +379,7 @@ func main() {
 			fyne.Do(func() {
 				if !isTokenOK || !isRepoOK {
 					connectionLabel.SetText(text.connectionError)
-					statusLabel.SetText(text.syncUnavailable)
+					setStatus(text.syncUnavailable)
 					return
 				}
 				connectionLabel.SetText(text.connectionConnected)
@@ -378,7 +406,17 @@ func main() {
 			if err != nil {
 				var repositoryErr *repositoryStatusError
 				if errors.As(err, &repositoryErr) && repositoryErr.stage == "repository" {
+					if isRepositoryTimeout(err) {
+						setStatus(text.retryingConnection)
+						time.AfterFunc(repositoryRetryInterval, func() { fyne.Do(refreshStatusAndConnection) })
+						return
+					}
 					setStatus(text.openRepoError + err.Error())
+					return
+				}
+				if isRepositoryTimeout(err) {
+					setStatus(text.retryingConnection)
+					time.AfterFunc(repositoryRetryInterval, func() { fyne.Do(refreshStatusAndConnection) })
 					return
 				}
 				setStatus(text.compareError + err.Error())
@@ -386,13 +424,17 @@ func main() {
 			}
 			switch st {
 			case RepoStatusCloudNewer:
-				setStatus(text.statusCloudNewer)
+				recordStatus(text.statusCloudNewer)
+				refreshTrayStatus()
 			case RepoStatusLocalNewer:
-				setStatus(text.statusLocalNewer)
+				recordStatus(text.statusLocalNewer)
+				refreshTrayStatus()
 			case RepoStatusConflict:
-				setStatus(text.statusConflict)
+				recordStatus(text.statusConflict)
+				refreshTrayStatus()
 			case RepoStatusSynced:
-				setStatus(text.statusSynced)
+				recordStatus(text.statusSynced)
+				refreshTrayStatus()
 			}
 		}()
 	}
@@ -517,6 +559,9 @@ func main() {
 	}
 	completeManualOperation := func(action string, err error) {
 		persistSyncResult(action, err)
+		if isRepositoryTimeout(err) {
+			time.AfterFunc(repositoryRetryInterval, func() { fyne.Do(refreshStatusAndConnection) })
+		}
 		setOperationBusy(false)
 	}
 	confirmedPull := func(cfg Config, allowDiverged bool) {
@@ -713,7 +758,6 @@ func main() {
 		container.NewGridWithColumns(2, pullBtn, pushBtn),
 		container.NewGridWithColumns(2, openBackupsButton, restoreBackupButton),
 		widget.NewSeparator(),
-		lastSyncLabel,
 	)
 	myWindow.SetContent(formContainer)
 
@@ -728,7 +772,7 @@ func main() {
 		func() {
 			fyne.Do(func() {
 				connectionLabel.SetText(text.githubWaiting)
-				statusLabel.SetText(text.githubWaiting)
+				setStatus(text.githubWaiting)
 			})
 		},
 		isGitHubReachable,
@@ -750,13 +794,28 @@ func autoSyncMenuLabel(enabled bool, label string) string {
 
 func formatLastSync(timestamp, status string, text uiText) string {
 	if timestamp == "" || status == "" {
-		return text.lastSyncNever
+		return text.lastActivityNever
+	}
+	activityLabel := text.lastCheckLabel
+	switch status {
+	case text.lastPushSuccess, text.lastPullSuccess, "Успешный Push", "Успешный Pull", "Successful Push", "Successful Pull":
+		activityLabel = text.lastSyncLabel
 	}
 	parsed, err := time.Parse(time.RFC3339, timestamp)
 	if err != nil {
-		return fmt.Sprintf("%s. %s%s", status, text.lastSyncLabel, timestamp)
+		return fmt.Sprintf("%s. %s%s", status, activityLabel, timestamp)
 	}
-	return fmt.Sprintf("%s. %s%s", status, text.lastSyncLabel, parsed.Local().Format("02.01.2006 15:04"))
+	return fmt.Sprintf("%s. %s%s", status, activityLabel, parsed.Local().Format("02.01.2006 15:04"))
+}
+
+func formatStatusWithHistory(status, timestamp, lastStatus string, text uiText) string {
+	if status == lastStatus && timestamp != "" {
+		return formatLastSync(timestamp, lastStatus, text)
+	}
+	if timestamp == "" || lastStatus == "" {
+		return status + "\n" + text.lastActivityNever
+	}
+	return status + "\n" + formatLastSync(timestamp, lastStatus, text)
 }
 
 func getLocalRepoPath() (string, error) {

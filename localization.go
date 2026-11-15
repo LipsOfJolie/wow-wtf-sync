@@ -54,7 +54,9 @@ type uiText struct {
 	about                   string
 	quit                    string
 	lastSyncLabel           string
-	lastSyncNever           string
+	lastCheckLabel          string
+	lastActivityNever       string
+	retryingConnection      string
 	processCheckError       string
 	syncFailed              string
 	lastPushSuccess         string
@@ -104,7 +106,7 @@ func textForLanguage(language string) uiText {
 			statusCloudNewer:        "☁️ В облаке данные новее. Рекомендуется скачать.",
 			statusLocalNewer:        "⬆️ Данные в облаке устарели. Рекомендуется загрузить.",
 			statusConflict:          "⚠️ Не удалось однозначно определить более новые файлы. Выберите Push или Pull.",
-			statusSynced:            "Синхронизация не требуется",
+			statusSynced:            "Проверка завершена: синхронизация не потребовалась",
 			refreshConfiguration:    "Обновить конфигурацию / Refresh",
 			saveError:               "❌ Ошибка сохранения: ",
 			loadConfigError:         "❌ Ошибка загрузки конфигурации: ",
@@ -134,7 +136,9 @@ func textForLanguage(language string) uiText {
 			about:                   "О программе",
 			quit:                    "Выход",
 			lastSyncLabel:           "Последняя синхронизация: ",
-			lastSyncNever:           "Последняя синхронизация: еще не выполнялась",
+			lastCheckLabel:          "Последняя проверка: ",
+			lastActivityNever:       "Синхронизация и проверка еще не выполнялись",
+			retryingConnection:      "⏳ Таймаут GitHub. Повторная проверка через 2 минуты.",
 			processCheckError:       "❌ Не удалось проверить процесс игры: ",
 			syncFailed:              "❌ Ошибка синхронизации: ",
 			lastPushSuccess:         "Успешный Push",
@@ -183,7 +187,7 @@ func textForLanguage(language string) uiText {
 		statusCloudNewer:        "☁️ Cloud data is newer. Download is recommended.",
 		statusLocalNewer:        "⬆️ Cloud data is outdated. Upload is recommended.",
 		statusConflict:          "⚠️ Could not determine unambiguously which files are newer. Choose Push or Pull.",
-		statusSynced:            "No synchronization is needed",
+		statusSynced:            "Check complete: no synchronization was needed",
 		refreshConfiguration:    "Refresh configuration",
 		saveError:               "❌ Could not save settings: ",
 		loadConfigError:         "❌ Could not load configuration: ",
@@ -213,7 +217,9 @@ func textForLanguage(language string) uiText {
 		about:                   "About",
 		quit:                    "Quit",
 		lastSyncLabel:           "Last synchronization: ",
-		lastSyncNever:           "Last synchronization: not yet performed",
+		lastCheckLabel:          "Last check: ",
+		lastActivityNever:       "No synchronization or check has been performed yet",
+		retryingConnection:      "⏳ GitHub timed out. Retrying the connection in 2 minutes.",
 		processCheckError:       "❌ Could not check the game process: ",
 		syncFailed:              "❌ Synchronization failed: ",
 		lastPushSuccess:         "Successful Push",

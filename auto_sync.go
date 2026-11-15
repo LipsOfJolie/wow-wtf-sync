@@ -9,6 +9,7 @@ const gameCloseGracePeriod = 3 * time.Second
 const githubRetryInterval = 10 * time.Second
 const githubStartupAttempts = 3
 const githubStartupRetryInterval = 5 * time.Second
+const repositoryRetryInterval = 2 * time.Minute
 
 type automaticSyncAction string
 

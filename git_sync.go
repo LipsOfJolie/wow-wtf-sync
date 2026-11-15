@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +22,14 @@ import (
 const gitNetworkTimeout = 60 * time.Second
 const gitStartupAttempts = 3
 const gitStartupRetryInterval = 5 * time.Second
+
+func isRepositoryTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) && networkErr.Timeout()
+}
 
 func init() {
 	gitclient.InstallProtocol("https", githttp.NewClient(&http.Client{Timeout: gitNetworkTimeout}))
